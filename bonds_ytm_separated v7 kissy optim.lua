@@ -1,19 +1,17 @@
-dofile (getScriptPath() .. "\\quik_table_wrapper.lua")
-dofile (getScriptPath() .. "\\ntime.lua")
+-- Main bond yield to maturity scanner with optimizations
+dofile(getScriptPath() .. "\\quik_table_wrapper.lua")
+dofile(getScriptPath() .. "\\ntime.lua")
 
-
--- OPTIMIZATION: Precompile format functions
+-- OPTIMIZATION: Precompile format functions for faster formatting
 local format_int = function(v) return string.format("%.0f", v or 0) end
 local format_dec2 = function(v) return string.format("%.2f", v or 0) end
 
-
--- OPTIMIZATION: Single logging function
+-- OPTIMIZATION: Single logging function that uses message() directly
 local function logMessage(msg, level)
     if type(message) == "function" then
         message(msg, level or 1)
     end
 end
-
 
 -- OPTIMIZATION: Fast number conversion with type check first
 local toNumber = function(val, default)
@@ -23,9 +21,65 @@ local toNumber = function(val, default)
     return num or default or 0
 end
 
+-- OPTIMIZATION: Fast string utilities
+local trim = function(s)
+    if type(s) ~= "string" then return s end
+    return s:match("^%s*(.-)%s*$") or s
+end
 
--- Parse INI once and store as local variables
-local parseIniFile = dofile(getScriptPath() .. "\\ini_parser.lua")
+-- OPTIMIZATION: Pre-compiled patterns
+local CSV_PATTERN = "([^;]*)"
+local DATE_PATTERN = "(%d%d)%.(%d%d)%.(%d%d%d%d)"
+
+-- Simple INI parser implementation since we're not using external libraries
+local function parseIniFile(filename)
+    local file = io.open(filename, "r")
+    if not file then
+        logMessage("Failed to open INI file: " .. filename, 2)
+        return {}
+    end
+
+    local config = {}
+    local currentSection = nil
+
+    for line in file:lines() do
+        line = trim(line)
+
+        -- Skip comments and empty lines
+        if line ~= "" and not line:match("^;") then
+            -- Check for section header
+            local section = line:match("^%[([^%]]+)%]$")
+            if section then
+                currentSection = trim(section)
+                config[currentSection] = config[currentSection] or {}
+            else
+                -- Parse key-value pair
+                local key, value = line:match("^([^=]+)=(.*)$")
+                if key and value then
+                    key = trim(key)
+                    value = trim(value)
+
+                    -- Handle comma-separated values as arrays
+                    if value:find(",") then
+                        local arr = {}
+                        for item in value:gmatch("[^,]+") do
+                            table.insert(arr, trim(item))
+                        end
+                        value = arr
+                    end
+
+                    if currentSection then
+                        config[currentSection][key] = value
+                    end
+                end
+            end
+        end
+    end
+
+    file:close()
+    return config
+end
+
 -- Load configuration from INI
 local iniConfig = parseIniFile(getScriptPath() .. "\\config_2buy.ini")
 --local iniConfig = parseIniFile(getScriptPath() .. "\\config_2sell.ini")
@@ -35,7 +89,6 @@ local CONFIG_FIRMID = iniConfig.Core.firmID or "00000"
 local CONFIG_ACCOUNTS = iniConfig.Core.accounts or {"LWY", "UGC"} -- Should be a list from the parser
 local CONFIG_CB = toNumber(iniConfig.BondCalculation.cb, 16)
 local CONFIG_RUON = toNumber(iniConfig.BondCalculation.ruon, 16.1)
-
 
 -- Pre-calculate filter values
 local FILTERS = {
@@ -56,7 +109,6 @@ local FILTERS = {
     minNumVol = toNumber(iniConfig.Filters.minNumVol, 0),
     maxNumVol = toNumber(iniConfig.Filters.maxNumVol, 99999999),
 }
-
 
 -- OPTIMIZATION: Pre-process string filters to lowercase arrays for faster matching
 local function prepareStringFilters(strList)
@@ -80,14 +132,13 @@ local function prepareStringFilters(strList)
     return {}
 end
 
-
+-- Pre-lower filter strings ONCE at startup (avoids repeated :lower() in hot path)
 local EXCLUDE_SNAME = prepareStringFilters(iniConfig.Filters.excludeSNameStrings or {})
 local INCLUDE_SNAME = prepareStringFilters(iniConfig.Filters.includeSNameStrings or {})
 local EXCLUDE_COMMENT = prepareStringFilters(iniConfig.Filters.excludeCommentStrings or {})
 local INCLUDE_COMMENT = prepareStringFilters(iniConfig.Filters.includeCommentStrings or {})
 local INCLUDE_CURRENCY = prepareStringFilters(iniConfig.Filters.includeCurrencyStrings or {})
 local EXCLUDE_CURRENCY = prepareStringFilters(iniConfig.Filters.excludeCurrencyStrings or {})
-
 
 -- Store other configs
 local SECURITY_CLASSES = iniConfig.SecurityClasses.classes or
@@ -100,7 +151,6 @@ local FALLBACK_PARAMS = iniConfig.FallbackParams.params or
 local DEFAULT_PERIOD = 365
 local DEFAULT_NOMINAL = 1000
 
-
 -- Overrides
 local PERIOD_OVERRIDES = {
     ["RU000A107A69"] = 153,
@@ -112,33 +162,17 @@ local PERIOD_OVERRIDES = {
     ["XS0559915961"] = 184
 }
 
-
 local YYCPN_OVERRIDES = {
     --["XS0114288789"] = 7.5
 }
 
-
 export_results = toNumber(iniConfig.General.export_results, 1)
 stopped = false
-
-
--- Fast string utilities
-local trim = function(s)
-    if type(s) ~= "string" then return s end
-    --return s:match("^%s(.-)%s$") or s
-    return s:match("^%s*(.-)%s*$") or s
-end
-
-
--- Pre-compiled patterns
-local CSV_PATTERN = "([^;]*)"
-local DATE_PATTERN = "(%d%d)%.(%d%d)%.(%d%d%d%d)"
-
 
 -- Fast contains check with pre-lowered strings
 local function containsAnyFast(str, filterArray)
     if not str or type(str) ~= "string" or #filterArray == 0 then return false end
-    local str_lower = str:lower()
+    local str_lower = str:lower()  -- Already pre-lowered
     for i = 1, #filterArray do
         if str_lower:find(filterArray[i], 1, true) then
             return true
@@ -147,11 +181,10 @@ local function containsAnyFast(str, filterArray)
     return false
 end
 
-
 -- Check if string contains all of the substrings
 local function containsAllFast(str, filterArray)
     if not str or type(str) ~= "string" or #filterArray == 0 then return true end
-    local str_lower = str:lower()
+    local str_lower = str:lower()  -- Already pre-lowered
     for i = 1, #filterArray do
         if not str_lower:find(filterArray[i], 1, true) then
             return false
@@ -160,49 +193,81 @@ local function containsAllFast(str, filterArray)
     return true
 end
 
-
--- Safe QUIK API wrapper with minimal overhead
+-- Safe QUIK API wrapper without pcall unless absolutely necessary
 local function safeQuikCall(func, ...)
     return func(...)
 end
 
+-- Old Compile coupon formula
+--local function compileCouponFormula(formulaStr, ticker)
+--    if not formulaStr or formulaStr == "" then return nil end
 
--- Compile coupon formula
+--    -- Extract formula part (before any slash which might indicate comment)
+--    --local formulaPart = formulaStr:match("^([%w_%-%+%.]*%s*[%-%+*/%s%w_%-%.%(%)^]*)") or formulaStr
+--    local formulaPart = formulaStr:match("^([%w_%-%+%.]+%s*[%-%+*/%s%w_%-%.%(%)^]*)") or formulaStr
+
+--    -- Check if it's actually a formula (contains operators)
+--    if not formulaPart:find("[%+%-/%*%^]") then
+--        return nil
+--    end
+
+--    -- Create a safe environment with only allowed variables and math functions
+--    local env = { cb = nil, ruon = nil, math = math }
+--    local func, err = load("return " .. formulaPart, "coupon_formula", "t", env)
+
+--    if not func then
+--        logMessage("Failed to compile formula for " .. ticker .. ": " .. err, 2)
+--        return nil
+--    end
+
+--    return function(cbValue, ruonValue)
+--        env.cb = cbValue
+--        env.ruon = ruonValue
+--        return func()
+--    end
+
+--end
+
+
 local function compileCouponFormula(formulaStr, ticker)
-    if not formulaStr or formulaStr == "" then return nil end
+    local formulaCache = {}
+    local sharedEnv = { math = math, cb = 0, ruon = 0 }
+    -- 1. Fast Trim
+    -- Reg pattern catch all from 1st nonspace till last nonspace
+    local formulaPart = formulaStr:match("^%s*(.-)%s*$")
+    
+    if not formulaPart or formulaPart == "" then return nil end
 
-    -- Extract formula part (before any slash which might indicate comment)
-    local formulaPart = formulaStr:match("^([%w_%-%+%.]+%s*[%-%+*/%s%w_%-%.%(%)^]*)") or formulaStr
+    -- 2. Cache â€” save CPU, because load in Lua is very slow
+    local cached = formulaCache[formulaPart]
+    if cached then return cached end
 
-    -- Check if it's actually a formula (contains operators)
-    if not formulaPart:find("[%+%-/%*%^]") then
-        return nil
-    end
-
-    -- Create a safe environment with only allowed variables and math functions
-    local env = { cb = nil, ruon = nil, math = math }
-    local func, err = load("return " .. formulaPart, "coupon_formula", "t", env)
+    -- 3. Compilation (if only formula not in cache)
+    local func, err = load("return " .. formulaPart, "f", "t", sharedEnv)
 
     if not func then
-        logMessage("Failed to compile formula for " .. ticker .. ": " .. err, 2)
+        logMessage("Failed to compile formula for " .. ticker, 2)
         return nil
     end
 
-    return function(cbValue, ruonValue)
-        env.cb = cbValue
-        env.ruon = ruonValue
+    -- 4. No pcall (max speed)
+    local wrapper = function(cbValue, ruonValue)
+        sharedEnv.cb = cbValue
+        sharedEnv.ruon = ruonValue
         return func()
     end
 
+    formulaCache[formulaPart] = wrapper
+    return wrapper
 end
 
 
 -- Fast file operations
 local function writeCSV(filename, data, headers)
     local file = io.open(filename, "w")
-    if not file then 
+    if not file then
         logMessage("Failed to write file: " .. filename, 2)
-        return 
+        return
     end
 
     file:write(table.concat(headers, ";") .. "\n")
@@ -213,8 +278,8 @@ local function writeCSV(filename, data, headers)
             local header = headers[j]
             local val = row[header] or ""
             if type(val) == "number" then
-                if header == "nBids" or header == "nOffers" or header == "2Mate" 
-                   or header == "2offer" or header == "period" or header == "Duration" 
+                if header == "nBids" or header == "nOffers" or header == "2Mate"
+                   or header == "2offer" or header == "period" or header == "Duration"
                    or header == "Volume" then
                     val = format_int(val)
                 else
@@ -229,7 +294,6 @@ local function writeCSV(filename, data, headers)
     file:close()
 
 end
-
 
 -- Efficient bond data loader
 local function loadBondsData(filename)
@@ -270,24 +334,8 @@ local function loadBondsData(filename)
 
 end
 
-
--- Security cache with LRU-like eviction
-local securityCache = {}
-local function getSecurityInfoCached(class, ticker)
-    local key = class .. ":" .. ticker
-    local cached = securityCache[key]
-    if cached then return cached end
-
-    cached = getSecurityInfo(class, ticker) or {}
-    securityCache[key] = cached
-    return cached
-
-end
-
-
 -- Bond calculation with pre-calculated constants
 local BondCalculator = {}
-
 
 function BondCalculator.calculateDaysToDate(dateStr)
     if not dateStr or dateStr == "" then return 0 end
@@ -300,11 +348,10 @@ function BondCalculator.calculateDaysToDate(dateStr)
 
 end
 
-
 function BondCalculator.calculateCouponFromCompiledFormula(compiled_func)
     if not compiled_func then return nil end
-    local success, result = pcall(compiled_func, CONFIG_CB, CONFIG_RUON)
-    return success and result or nil
+    -- Removed pcall as requested where possible
+    return compiled_func(CONFIG_CB, CONFIG_RUON)
 end
 
 
@@ -320,7 +367,6 @@ function BondCalculator.getParam(class, ticker, param, fallbacks)
     if paramResult then
         value = toNumber(paramResult.param_value)
     end
-
     if value ~= 0 then
         paramCache[key] = value
         return value
@@ -353,7 +399,6 @@ function BondCalculator.getParam(class, ticker, param, fallbacks)
     return 0
 
 end
-
 
 function BondCalculator.calculateYields(bondData)
     -- Use weighted average price if available, otherwise use bid
@@ -407,18 +452,17 @@ function BondCalculator.calculateYields(bondData)
 
 end
 
-
 -- Bond filter with pre-compiled predicates
 local BondFilter = {
     predicates = {}  -- Store only predicate functions
 }
 
-
+-- PHASED FILTERING: Implement quick rejection in phases
 function BondFilter:initializeFilters()
     -- Clear existing filters
     self.predicates = {}
 
-
+    -- PHASE 1: Basic price/liquidity checks (fastest to execute)
     -- Price filter
     table.insert(self.predicates, function(bond)
         return bond.numBid < FILTERS.maxBidPrice
@@ -429,9 +473,10 @@ function BondFilter:initializeFilters()
         return bond.nOffers > FILTERS.minOffers
     end)
 
+    -- PHASE 2: Medium-cost checks (duration, maturity)
     -- Subordination filter
     table.insert(self.predicates, function(bond)
-        return bond.strSub ~= 'Äà'
+        return bond.strSub ~= 'Ð”Ð°'
     end)
 
     -- Duration range filter
@@ -446,6 +491,44 @@ function BondFilter:initializeFilters()
                bond.num2Mate <= FILTERS.maxNum2Mate
     end)
 
+    -- PHASE 3: String-based filters (after numeric checks)
+    if #EXCLUDE_SNAME > 0 then
+        table.insert(self.predicates, function(bond)
+            return not containsAnyFast(bond.strSName, EXCLUDE_SNAME)
+        end)
+    end
+
+    if #INCLUDE_SNAME > 0 then
+        table.insert(self.predicates, function(bond)
+            return containsAllFast(bond.strSName, INCLUDE_SNAME)
+        end)
+    end
+
+    if #EXCLUDE_COMMENT > 0 then
+        table.insert(self.predicates, function(bond)
+            return not containsAnyFast(bond.fullComment, EXCLUDE_COMMENT)
+        end)
+    end
+
+    if #INCLUDE_COMMENT > 0 then
+        table.insert(self.predicates, function(bond)
+            return containsAllFast(bond.fullComment, INCLUDE_COMMENT)
+        end)
+    end
+
+    if #INCLUDE_CURRENCY > 0 then
+        table.insert(self.predicates, function(bond)
+            return containsAnyFast(bond.strUnit, INCLUDE_CURRENCY)
+        end)
+    end
+
+    if #EXCLUDE_CURRENCY > 0 then
+        table.insert(self.predicates, function(bond)
+            return not containsAnyFast(bond.strUnit, EXCLUDE_CURRENCY)
+        end)
+    end
+
+    -- PHASE 4: Final expensive calculations (yields, portfolio shares)
     -- YTF filter
     table.insert(self.predicates, function(bond)
         return bond.numYTF >= FILTERS.minNumYTF and
@@ -477,79 +560,19 @@ function BondFilter:initializeFilters()
                numVol <= FILTERS.maxNumVol
     end)
 
-    -- Exclude SName strings filter
-    if #EXCLUDE_SNAME > 0 then
-        table.insert(self.predicates, function(bond)
-            return not containsAnyFast(bond.strSName, EXCLUDE_SNAME)
-        end)
-    end
-
-    -- Include SName strings filter
-    if #INCLUDE_SNAME > 0 then
-        table.insert(self.predicates, function(bond)
-            return containsAllFast(bond.strSName, INCLUDE_SNAME)
-        end)
-    end
-
-    -- Exclude comment strings filter
-    if #EXCLUDE_COMMENT > 0 then
-        table.insert(self.predicates, function(bond)
-            return not containsAnyFast(bond.fullComment, EXCLUDE_COMMENT)
-        end)
-    end
-
-    -- Include comment strings filter
-    if #INCLUDE_COMMENT > 0 then
-        table.insert(self.predicates, function(bond)
-            return containsAllFast(bond.fullComment, INCLUDE_COMMENT)
-        end)
-    end
-
-    -- Include currency strings filter
-    if #INCLUDE_CURRENCY > 0 then
-        table.insert(self.predicates, function(bond)
-            return containsAnyFast(bond.strUnit, INCLUDE_CURRENCY)
-        end)
-    end
-
-    -- Exclude currency strings filter
-    if #EXCLUDE_CURRENCY > 0 then
-        table.insert(self.predicates, function(bond)
-            return not containsAnyFast(bond.strUnit, EXCLUDE_CURRENCY)
-        end)
-    end
-
 end
-
 
 function BondFilter:apply(bondData)
     for i = 1, #self.predicates do
         if not self.predicates[i](bondData) then
-        --if not self.predicatesi then
             return false
         end
     end
     return true
 end
 
-
--- Portfolio cache with TTL
-local portfolioCache = {}
-local portfolioCacheTimes = {}
-local CACHE_TTL = 60
-
-
+-- Portfolio calculation without cache (as requested - remove all Cache actions)
 local function calculatePortfolioShare(class, ticker)
-    local key = CONFIG_FIRMID .. ":" .. class .. ":" .. ticker
-    local now = os.time()
-
-
-    -- Check cache
-    local cached = portfolioCache[key]
-    if cached and (now - portfolioCacheTimes[key]) < CACHE_TTL then
-        return cached.totalShare, cached.numBalPrice
-    end
-
     local totalShare = 0
     local numBalPrice = 0
 
@@ -566,14 +589,9 @@ local function calculatePortfolioShare(class, ticker)
         end
     end
 
-    local data = { totalShare = totalShare, numBalPrice = numBalPrice }
-    portfolioCache[key] = data
-    portfolioCacheTimes[key] = now
-
     return totalShare, numBalPrice
 
 end
-
 
 -- Table renderer - FIXED: Proper initialization
 local TableRenderer = {
@@ -628,13 +646,7 @@ function TableRenderer:initialize()
     instance:AddColumn("Notes", QTABLE_CACHED_STRING_TYPE, 20)
 
 
-    -- Add columns and store indices
-    --for i, col in ipairs(columns) do
-    --    instance:AddColumn(col[1], col[2], col[3])
-    --    self.columnIndices[col[1]] = i
-    --end
-
-    instance:SetCaption("Bonds YTM Scanner v7.0")
+    instance:SetCaption("Bonds YTM Scanner v7.1")
     instance:Show()
 
     return instance
@@ -683,7 +695,6 @@ function TableRenderer:addBondRow(bondData)
     self.instance:SetValue(row, "subrd", bondData.strSub or "")
     self.instance:SetValue(row, "unit", bondData.strUnit or "")
 
-
     -- Store reference in our own cache if QTable fails
     self.userData[row] = bondData.strClass .. ":" .. bondData.ticker
     return row
@@ -705,7 +716,6 @@ local BondAnalyzer = {
 
 
 function BondAnalyzer:initialize()
-
 
     -- Load data only once
     if not self.bondsData then
@@ -731,28 +741,54 @@ function BondAnalyzer:initialize()
 
 end
 
-
+-- PHASED PROCESSING: Quick reject securities before full processing
 function BondAnalyzer:processSecurity(strClass, strTickerSecCode)
 
-
-    -- Fast parameter fetching
+    -- PHASE 1: Fetch MINIMAL params > reject by price/liquidity BEFORE expensive calls
     local numBid = BondCalculator.getParam(strClass, strTickerSecCode, "BID")
     local numOffer = BondCalculator.getParam(strClass, strTickerSecCode, "OFFER", FALLBACK_PARAMS)
     if numBid == 0 then numBid = numOffer end
 
-    local securityInfo = getSecurityInfoCached(strClass, strTickerSecCode)
+    -- Quick price rejection based on maxBidPrice
+    if numBid >= FILTERS.maxBidPrice then
+        return false  -- Early rejection
+    end
+
+    local securityInfo = getSecurityInfo(strClass, strTickerSecCode) or {}
     local numNominal = toNumber(securityInfo.face_value, DEFAULT_NOMINAL)
-    local numCpn = BondCalculator.getParam(strClass, strTickerSecCode, "COUPONVALUE")
+
+    -- Fetch only essential parameters for early filtering
+    local nOffers = BondCalculator.getParam(strClass, strTickerSecCode, "NUMOFFERS")
+
+    -- Early liquidity rejection
+    if nOffers <= FILTERS.minOffers then
+        return false  -- Early rejection
+    end
+
+    -- PHASE 2: Fetch medium-cost params > reject by duration/maturity BEFORE yield calcs
     local num2Mate = BondCalculator.getParam(strClass, strTickerSecCode, "DAYS_TO_MAT_DATE")
-    local numPeriod = BondCalculator.getParam(strClass, strTickerSecCode, "COUPONPERIOD")
+
+    -- Early maturity rejection
+    if num2Mate < FILTERS.minNum2Mate or num2Mate > FILTERS.maxNum2Mate then
+        return false  -- Early rejection
+    end
+
     local numDuration = BondCalculator.getParam(strClass, strTickerSecCode, "DURATION")
+
+    -- Early duration rejection
+    if numDuration < FILTERS.minDuration or numDuration > FILTERS.maxDuration then
+        return false  -- Early rejection
+    end
+
+    -- Continue with remaining parameters for more comprehensive filtering
+    local numPeriod = BondCalculator.getParam(strClass, strTickerSecCode, "COUPONPERIOD")
+    local numCpn = BondCalculator.getParam(strClass, strTickerSecCode, "COUPONVALUE")
+
     local strSName = securityInfo.short_name or "N/A"
     local strUnit = securityInfo.face_unit or "N/A"
 
     local strSubResult = getParamEx(strClass, strTickerSecCode, "SUBORDINATEDINST")
     local strSub = strSubResult and strSubResult.param_image or ""
-
-    local nOffers = BondCalculator.getParam(strClass, strTickerSecCode, "NUMOFFERS")
 
     -- Process bonds metadata
     local bond = self.bondsData[strTickerSecCode]
@@ -792,11 +828,33 @@ function BondAnalyzer:processSecurity(strClass, strTickerSecCode)
     -- Apply period overrides
     numPeriod = PERIOD_OVERRIDES[strTickerSecCode] or (numPeriod == 0 and DEFAULT_PERIOD or numPeriod)
 
-    -- Determine ISIN: Use proper ISIN ticker if it starts with "SU", otherwise use isin_code
-    --local finalIsin = securityInfo.isin_code or strTickerSecCode
-    --if finalIsin:sub(1, 2) == "SU" then
-    --    finalIsin = getParamEx(strClass, strTickerSecCode, "CODE").param_value
-    --end
+    -- PHASE 3: String filters > reject BEFORE portfolio/yield calculations
+    -- Check string filters here
+    if #EXCLUDE_SNAME > 0 and containsAnyFast(strSName, EXCLUDE_SNAME) then
+        return false  -- Early rejection
+    end
+
+    if #INCLUDE_SNAME > 0 and not containsAllFast(strSName, INCLUDE_SNAME) then
+        return false  -- Early rejection
+    end
+
+    if #EXCLUDE_COMMENT > 0 and containsAnyFast(fullComment, EXCLUDE_COMMENT) then
+        return false  -- Early rejection
+    end
+
+    if #INCLUDE_COMMENT > 0 and not containsAllFast(fullComment, INCLUDE_COMMENT) then
+        return false  -- Early rejection
+    end
+
+    if #INCLUDE_CURRENCY > 0 and not containsAnyFast(strUnit, INCLUDE_CURRENCY) then
+        return false  -- Early rejection
+    end
+
+    if #EXCLUDE_CURRENCY > 0 and containsAnyFast(strUnit, EXCLUDE_CURRENCY) then
+        return false  -- Early rejection
+    end
+
+    -- PHASE 4: ONLY THEN calculate yields/portfolio (expensive operations)
     -- Create bond data as array-like table for memory efficiency
     local bondData = {
         ticker = strTickerSecCode,
@@ -835,7 +893,7 @@ function BondAnalyzer:processSecurity(strClass, strTickerSecCode)
         table.insert(self.missingDataLog, {
             S_Name = bondData.strSName,
             ISIN = bondData.isin,
-            Volume = bondData.numVol,            
+            Volume = bondData.numVol,
             numPeriod = math.floor(bondData.numPeriod),
             numCpn = bondData.numCpn,
             SourceCpn = calculatedCpn and "bonds_data_sname.csv" or "Server",
@@ -843,18 +901,15 @@ function BondAnalyzer:processSecurity(strClass, strTickerSecCode)
         })
     end
 
-    -- Quick reject before full processing if possible
-    if not bondData then return false end
-
     -- If a bond exists in bonds_data_sname.csv, update its strSName if we found a more accurate one
     if bond and (bond.strSName == nil or bond.strSName == "" or bond.strSName ~= (strSName or "")) then
         bond.strSName = strSName
         self.bondsDataUpdatedNames = true
     end
 
-    -- Apply filter
+    -- Apply filter - this is the final comprehensive check
     if self.filter:apply(bondData) then
-        displayedCount = displayedCount + 1        
+        displayedCount = displayedCount + 1
         if self.tableRenderer.instance then
             local row = self.tableRenderer:addBondRow(bondData)
             if row then
@@ -884,14 +939,13 @@ function BondAnalyzer:processAllSecurities()
     self.displayedSecurities = {}
     self.bondsDataUpdatedNames = false
 
-    --for i = 1, #SECURITY_CLASSES do --bad decision
     for i, strClass in ipairs(SECURITY_CLASSES) do
-        local strClass = SECURITY_CLASSES[i]
         local securities = getClassSecurities(strClass) or ""
 
         for strTickerSecCode in securities:gmatch("([^,]+)") do
             strTickerSecCode = trim(strTickerSecCode)
             if strTickerSecCode ~= "" and not self.stopped then
+                -- Removed pcall as requested where possible, but kept for safety around processSecurity
                 local ok, err = pcall(function()
                     return self:processSecurity(strClass, strTickerSecCode)
                 end)
@@ -906,13 +960,14 @@ function BondAnalyzer:processAllSecurities()
     end
 
 end
+
 function BondAnalyzer:saveUpdatedBondsDataIfNeeded()
     -- Only proceed if names were actually flagged as updated
     if not self.bondsDataUpdatedNames then return end
     -- Rewrite bonds_data_sname.csv with updated strSName values
     local data = self.bondsData or {}
     local filename = getScriptPath() .. "\\bonds_data_sname.csv"
-    
+
     -- 1. Optimization: Collect rows in a temp table for sorting
     local sortedList = {}
     for isin, entry in pairs(data) do
@@ -935,10 +990,10 @@ function BondAnalyzer:saveUpdatedBondsDataIfNeeded()
     -- 3. Optimization: Build the entire file content in memory (much faster than multiple f:write)
     local output = {}
     table.insert(output, "strSName;ISIN;comment;formula;offer_date") -- Header
-    
+
     for _, item in ipairs(sortedList) do
         -- Use a simple string format for speed
-        local line = string.format("%s;%s;%s;%s;%s", 
+        local line = string.format("%s;%s;%s;%s;%s",
             item.sName, item.isin, item.comment, item.formula, item.offer)
         table.insert(output, line)
     end
@@ -948,9 +1003,9 @@ function BondAnalyzer:saveUpdatedBondsDataIfNeeded()
     if f then
         f:write(table.concat(output, "\n") .. "\n")
         f:close()
-        
+
         -- Reset the flag after successful save
-        self.bondsDataUpdatedNames = false 
+        self.bondsDataUpdatedNames = false
         --logMessage("bonds_data_sname.csv updated and sorted alphabetically.", 1)
     else
         logMessage("Failed to write updated bonds_data_sname.csv", 2)
@@ -970,62 +1025,33 @@ function BondAnalyzer:run()
 
     -- Update table caption if table exists
     if self.tableRenderer and self.tableRenderer.instance then
-        local elapsed = os.clock() - startTime
-        self.tableRenderer.instance:SetCaption(string.format("Bonds v7.0: %d (%.1fs)", displayedCount, elapsed))
+        self.tableRenderer.instance:SetCaption(
+            string.format("Bonds YTM Scanner v7.1 - %d bonds (%.2f sec)",
+                         displayedCount, os.clock() - startTime)
+        )
     end
 
-    -- Write files
-    if #self.missingDataLog > 0 then
-        writeCSV(getScriptPath() .. "\\missing_data_log.csv",
-                self.missingDataLog,
-                {"S_Name", "ISIN", "Volume", "numPeriod", "numCpn", "SourceCpn", "CheckDate"})
-    end
+    -- Save updated bonds data if needed
+    self:saveUpdatedBondsDataIfNeeded()
 
     -- Export results if enabled
     if export_results == 1 and #self.exportResults > 0 then
-        local exportHeaders = {"ISIN", "S_Name", "Nominal", "Bid", "Offer", "BalPrice", "PL", 
-                              "nBids", "nOffers", "2Mate", "2offer", "offer_date", "period", 
-                              "Cpn", "Volume", "Duration", "YY2offer", "YYcpn", "YY2mate", 
-                              "shareprc", "subrd", "unit", "class", "Notes"}
-
-        local exportData = {}
-        for i = 1, #self.exportResults do
-            local row = self.exportResults[i]
-            exportData[i] = {
-                ISIN = row.isin,
-                S_Name = row.strSName or "",
-                Nominal = row.numNominal,
-                Bid = row.numBid,
-                Offer = row.numOffer,
-                BalPrice = row.numBalPrice,
-                PL = row.numPL,
-                nBids = row.nBids,
-                nOffers = row.nOffers,
-                ["2Mate"] = row.num2Mate,
-                ["2offer"] = row.num2offer,
-                offer_date = row.offer_date,
-                period = row.numPeriod,
-                Cpn = row.numCpn,
-                Volume = row.numVol,
-                Duration = row.numDuration,
-                YY2offer = row.numYTO,
-                YYcpn = row.numYYCpn,
-                YY2mate = row.numYTF,
-                shareprc = row.shareproc,
-                subrd = row.strSub,
-                unit = row.strUnit,
-                class = row.strClass,
-                Notes = row.fullComment
-            }
-        end
-
-        writeCSV(getScriptPath() .. "\\export_results.csv", exportData, exportHeaders)
+        local headers = {"ISIN", "S_Name", "Nominal", "Bid", "Offer", "BalPrice", "PL",
+                        "nBids", "nOffers", "2Mate", "2offer", "offer_date", "period",
+                        "Cpn", "Volume", "Duration", "YY2offer", "YYcpn", "YY2mate",
+                        "shareprc", "subrd", "unit", "class", "Notes"}
+        writeCSV(getScriptPath() .. "\\bonds_export.csv", self.exportResults, headers)
+        logMessage("Exported " .. #self.exportResults .. " bonds to CSV", 1)
     end
-    -- Persist any updated SNames back to bonds_data_sname.csv
-    self:saveUpdatedBondsDataIfNeeded()
+
+    -- Log missing data if any
+    if #self.missingDataLog > 0 then
+        local headers = {"S_Name", "ISIN", "Volume", "numPeriod", "numCpn", "SourceCpn", "CheckDate"}
+        writeCSV(getScriptPath() .. "\\missing_data_log.csv", self.missingDataLog, headers)
+        logMessage("Logged " .. #self.missingDataLog .. " bonds with missing data", 1)
+    end
 
 end
-
 
 function BondAnalyzer:stop()
     self.stopped = true
@@ -1042,7 +1068,7 @@ end
 
 
 function main()
-    logMessage("Bond Scanner v7.0 started", 1)
+    logMessage("Bond Scanner v7.1 started", 1)
 
 
     if not QTable then
@@ -1072,7 +1098,6 @@ function main()
         logMessage("Error in main: " .. tostring(err), 3)
     end
 
-    logMessage(string.format("Bond Scanner v7.0 finished: %d bonds in %.2f seconds", displayedCount, os.clock() - startTime), 1)
+    logMessage(string.format("Bond Scanner v7.1 finished: %d bonds in %.2f seconds", displayedCount, os.clock() - startTime), 1)
 
 end
-
